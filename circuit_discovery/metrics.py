@@ -490,7 +490,7 @@ def evaluate_good_bad_accuracy(
     model.eval()
 
     for batch in dataloader:
-        logits = model(batch["input_ids"], circuit=circuit)
+        logits = model(batch["input_ids"], circuit=circuit, lengths=batch["length"].to(device=device))
 
         if "target bad" not in batch:
             continue
@@ -572,7 +572,7 @@ def evaluate_classification_accuracy(
     model.eval()
 
     for batch in dataloader:
-        logits = model(batch["input_ids"], circuit=circuit)
+        logits = model(batch["input_ids"], circuit=circuit, lengths=batch["length"].to(device=device))
         preds = logits.argmax(dim=-1)
         labels = batch["label"].to(device=logits.device)
 
