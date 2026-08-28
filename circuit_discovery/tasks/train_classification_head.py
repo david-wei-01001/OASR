@@ -103,7 +103,7 @@ def train_classification_head(
             # unablated model -- there's no circuit being discovered or
             # tested yet, so skip the (equivalent-cost but conceptually
             # unnecessary) dense edge-mask machinery entirely.
-            logits = model(input_values, circuit=None)
+            logits = model(input_values, circuit=None, lengths=batch["length"].to(device=device))
             loss = F.cross_entropy(logits, labels)
 
             optimizer.zero_grad()
