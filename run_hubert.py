@@ -22,6 +22,10 @@ Examples:
     python run_hubert.py --task_type consonant_classification \\
         --n_particles 3 --lambda_edge_max 0.66 --lambda_node_max 10.0
 
+    # spread 6 particles round-robin over two GPUs, combine repulsion on cuda:0
+    python run_hubert.py --task_type vowel_classification \\
+        --n_particles 6 --devices cuda:0 cuda:1 --repulsion_device cuda:0
+
 Turning a repulsion term off: pass --lambda_edge_max 0 or --lambda_node_max 0.
 The ramp schedule returns 0 for the whole run in that case -- there's no
 separate --disable_* flag, one fewer thing to keep in sync.
@@ -30,12 +34,16 @@ Run the two tasks as two independent invocations (as designed): this script
 discovers N mutually-repelling circuits for ONE task at a time. It does not
 run vowel and consonant particles against each other.
 
-Parallelism: not implemented yet. --devices is accepted and threaded through
-today, but every particle still runs on --devices[0] (or the auto-picked
-device) until multi-GPU/multi-process dispatch lands -- see
-circuit_discovery/tasks/discovery_setup.py's module docstring, and the
-Particle / per_particle_forward / combine_repulsion / per_particle_backward_step
-split, for exactly where that will hook in.
+Parallelism: IMPLEMENTED (single-process multi-GPU). --devices takes one or
+more device strings; particles are assigned round-robin across them, each
+unique device gets its own frozen model replica, and --repulsion_device
+picks where the cross-particle edge/node repulsion terms get combined each
+step (defaults to devices[0]). See
+circuit_discovery/multi_particle.py's module docstring for the design and
+circuit_discovery/tasks/discovery_setup.py's Particle /
+per_particle_forward / combine_repulsion / per_particle_backward_step split
+for exactly how each phase runs. With a single device (the default) this is
+behaviorally identical to the old single-GPU code path.
 """
 
 from __future__ import annotations
@@ -47,11 +55,11 @@ from pathlib import Path
 from circuit_discovery.run import get_compute_device
 from circuit_discovery.tasks.articulatory_index import TASK_SPECS, load_articulatory_dataset
 from circuit_discovery.tasks.discovery_setup import (
-    build_node_incidence,
+    build_node_incidence_for_devices,
     build_particles,
     combine_repulsion,
     finalize_and_report,
-    load_hubert_classifier_for_task,
+    load_hubert_classifiers_for_devices,
     node_probs_from_edge_probs,
     per_particle_backward_step,
     per_particle_forward,
@@ -109,8 +117,11 @@ def parse_args() -> argparse.Namespace:
                          help="defaults to circuits_discovered/hubert_circuits/{task_type}/")
 
     parser.add_argument("--devices", nargs="+", default=None,
-                         help="reserved for future multi-GPU dispatch; every particle runs on "
-                              "devices[0] for now regardless of how many are listed.")
+                         help="one or more devices (e.g. --devices cuda:0 cuda:1). Particles are "
+                              "assigned round-robin across them. Defaults to a single auto-picked device.")
+    parser.add_argument("--repulsion_device", default=None,
+                         help="device where cross-particle edge/node repulsion is combined each step "
+                              "(the multi-GPU synchronization point). Defaults to devices[0].")
 
     return parser.parse_args()
 
@@ -120,6 +131,7 @@ def main() -> None:
 
     default_device = get_compute_device()
     devices = args.devices if args.devices is not None else [default_device]
+    hub_device = args.repulsion_device or devices[0]
 
     seeds = args.seeds if args.seeds is not None else [52 + i for i in range(args.n_particles)]
     if len(seeds) != args.n_particles:
@@ -132,9 +144,11 @@ def main() -> None:
         else Path("circuits_discovered") / "hubert_circuits" / args.task_type
     )
 
-    print(f"Loading {args.model_name} + {args.task_type} head on {devices[0]}...")
-    model = load_hubert_classifier_for_task(
-        args.task_type, head_path=args.head_path, model_name=args.model_name, device=devices[0],
+    print(
+        f"Loading {args.model_name} + {args.task_type} head, one replica per device in {sorted(set(devices))}..."
+    )
+    models_by_device = load_hubert_classifiers_for_devices(
+        args.task_type, devices, head_path=args.head_path, model_name=args.model_name,
     )
     data = load_articulatory_dataset(args.task_type, batch_size=args.batch_size)
 
@@ -161,13 +175,21 @@ def main() -> None:
     )
 
     particles = build_particles(
-        seeds=seeds, devices=devices, model=model, discogp_config_kwargs=discogp_config_kwargs,
+        seeds=seeds, devices=devices, models_by_device=models_by_device,
+        discogp_config_kwargs=discogp_config_kwargs,
     )
+    print("Particle -> device assignment: " + ", ".join(f"seed{p.seed}->{p.device}" for p in particles))
 
     train_loader = fixed_order_dataloader(data.train.dataset, batch_size=args.batch_size, seed=seeds[0])
     n_epochs = args.n_epochs
     complete_start = int(args.completeness_start_frac * n_epochs)
-    incidence, node_keys = build_node_incidence(particles[0].discogp.masks, devices[0])
+
+    # One incidence matrix per unique device particles actually run on --
+    # node_probs_from_edge_probs needs incidence on the SAME device as the
+    # edge_probs it's multiplying against, which varies per particle now.
+    incidence_by_device, node_keys = build_node_incidence_for_devices(
+        particles[0].discogp.masks, devices,
+    )
 
     snapshot_epochs = {n_epochs - 1}
     if args.snapshot_every:
@@ -177,9 +199,10 @@ def main() -> None:
 
     print(
         f"Training {args.n_particles} particles jointly for {n_epochs} epochs "
-        f"({len(train_loader)} steps/epoch, {len(node_keys)} nodes / {incidence.shape[1]} edges "
-        f"in the full graph), task={args.task_type} ({num_classes}-way), "
-        f"lambda_edge_max={args.lambda_edge_max}, lambda_node_max={args.lambda_node_max}..."
+        f"({len(train_loader)} steps/epoch, {len(node_keys)} nodes / {incidence_by_device[devices[0]].shape[1]} "
+        f"edges in the full graph), task={args.task_type} ({num_classes}-way), "
+        f"lambda_edge_max={args.lambda_edge_max}, lambda_node_max={args.lambda_node_max}, "
+        f"devices={sorted(set(devices))}, repulsion_device={hub_device}..."
     )
     t0 = time.time()
 
@@ -196,17 +219,33 @@ def main() -> None:
         for batch in train_loader:
             task_losses = []
             edge_probs = []
+            # Each particle's forward runs on its own device -- issuing them
+            # back to back here lets their CUDA kernels queue and overlap
+            # across devices (see multi_particle.py's module docstring).
             for particle, lam_sparse in zip(particles, lambda_sparse_vals):
                 task_loss, probs = per_particle_forward(particle, batch, lambda_sparse=lam_sparse)
                 task_losses.append(task_loss)
                 edge_probs.append(probs)
 
-            node_probs = [node_probs_from_edge_probs(ep, incidence) for ep in edge_probs]
+            node_probs = [
+                node_probs_from_edge_probs(ep, incidence_by_device[str(ep.device)])
+                for ep in edge_probs
+            ]
+            # Synchronization point: every particle's probs get moved to
+            # hub_device inside combine_repulsion before the pairwise terms.
             edge_rep, node_rep = combine_repulsion(
                 edge_probs, node_probs, lambda_edge=lambda_edge_rep, lambda_node=lambda_node_rep,
+                hub_device=hub_device,
             )
 
-            joint_loss = sum(task_losses) + lambda_edge_rep * edge_rep + lambda_node_rep * node_rep
+            # task_losses live on their own particle's device; `.to(hub_device)`
+            # is differentiable, so summing here still backprops correctly to
+            # each particle's own edge_logits on its own device.
+            joint_loss = (
+                sum(l.to(device=hub_device) for l in task_losses)
+                + lambda_edge_rep * edge_rep
+                + lambda_node_rep * node_rep
+            )
             joint_loss.backward()
             for particle in particles:
                 per_particle_backward_step(particle)
