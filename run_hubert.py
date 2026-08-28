@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""
+run_hubert.py
+
+CLI entrypoint for OASR-style joint multi-particle circuit discovery --
+edge repulsion AND node repulsion applied simultaneously to N particles
+trained together in one loop, not the sequential find-a-circuit-then-repel-
+from-it pattern -- against a CircuitHubert backbone plus a frozen, already-
+trained classification head, on one Articulatory Index task per run.
+
+Run from the OASR repo root, after:
+  1. Building the task's dataset:
+       from circuit_discovery.tasks.articulatory_index import prepare_and_save_articulatory_dataset
+       prepare_and_save_articulatory_dataset("vowel_classification", data_dir=DATA_DIR)
+       prepare_and_save_articulatory_dataset("consonant_classification", data_dir=DATA_DIR)
+  2. Training and saving that task's head:
+       python -m circuit_discovery.tasks.train_classification_head --task_type vowel_classification
+       python -m circuit_discovery.tasks.train_classification_head --task_type consonant_classification
+
+Examples:
+    python run_hubert.py --task_type vowel_classification
+    python run_hubert.py --task_type consonant_classification \\
+        --n_particles 3 --lambda_edge_max 0.66 --lambda_node_max 10.0
+
+Turning a repulsion term off: pass --lambda_edge_max 0 or --lambda_node_max 0.
+The ramp schedule returns 0 for the whole run in that case -- there's no
+separate --disable_* flag, one fewer thing to keep in sync.
+
+Run the two tasks as two independent invocations (as designed): this script
+discovers N mutually-repelling circuits for ONE task at a time. It does not
+run vowel and consonant particles against each other.
+
+Parallelism: not implemented yet. --devices is accepted and threaded through
+today, but every particle still runs on --devices[0] (or the auto-picked
+device) until multi-GPU/multi-process dispatch lands -- see
+circuit_discovery/tasks/discovery_setup.py's module docstring, and the
+Particle / per_particle_forward / combine_repulsion / per_particle_backward_step
+split, for exactly where that will hook in.
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
+from circuit_discovery.run import get_compute_device
+from circuit_discovery.tasks.articulatory_index import TASK_SPECS, load_articulatory_dataset
+from circuit_discovery.tasks.discovery_setup import (
+    build_node_incidence,
+    build_particles,
+    combine_repulsion,
+    finalize_and_report,
+    load_hubert_classifier_for_task,
+    node_probs_from_edge_probs,
+    per_particle_backward_step,
+    per_particle_forward,
+    ramp_schedule,
+    run_completeness_step,
+)
+from circuit_discovery.utils import fixed_order_dataloader
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    parser.add_argument(
+        "--task_type", required=True, choices=sorted(TASK_SPECS),
+        help="which Articulatory Index task to discover circuits for (one task per run).",
+    )
+    parser.add_argument("--model_name", default="hubert-base-ls960",
+                         choices=["hubert-base-ls960", "wav2vec2-base-960h", "wav2vec2-base"])
+    parser.add_argument("--head_path", default=None,
+                         help="defaults to circuit_discovery/trained_heads/{task_type}_head.pt")
+
+    parser.add_argument("--n_particles", type=int, default=3,
+                         help="how many mutually-repelling circuits to discover simultaneously.")
+    parser.add_argument("--seeds", type=int, nargs="+", default=None,
+                         help="one seed per particle; defaults to [52, 53, 54, ...] up to n_particles.")
+
+    parser.add_argument("--lambda_edge_max", type=float, default=0.66,
+                         help="max strength of pairwise edge-probability repulsion. 0 disables it.")
+    parser.add_argument("--edge_repulsion_warmup_frac", type=float, default=0.8)
+    parser.add_argument("--lambda_node_max", type=float, default=10.0,
+                         help="max strength of pairwise node-probability (noisy-OR) repulsion. 0 disables it.")
+    parser.add_argument("--node_repulsion_warmup_frac", type=float, default=0.8)
+
+    parser.add_argument("--n_epochs", type=int, default=40)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr_e", type=float, default=0.07)
+
+    parser.add_argument("--edge_logit_init_mean", type=float, default=0.1)
+    parser.add_argument("--edge_logit_init_std", type=float, default=0.01)
+    parser.add_argument("--random_mode", default="gumbel_sigmoid", choices=["gumbel_sigmoid", "none"])
+    parser.add_argument("--gs_temp_edge", type=float, default=1.0)
+
+    parser.add_argument("--lambda_sparse_e", type=float, default=1.0)
+    parser.add_argument("--min_times_lambda_sparse_e", type=float, default=0.01)
+    parser.add_argument("--max_times_lambda_sparse_e", type=float, default=20.0)
+
+    parser.add_argument("--lambda_complete_e", type=float, default=0.01)
+    parser.add_argument("--completeness_start_frac", type=float, default=0.8)
+
+    parser.add_argument("--snapshot_every", type=int, default=None,
+                         help="also snapshot circuits every N epochs, not just at the end (useful for long runs).")
+    parser.add_argument("--save_dir", default=None,
+                         help="defaults to circuits_discovered/hubert_circuits/{task_type}/")
+
+    parser.add_argument("--devices", nargs="+", default=None,
+                         help="reserved for future multi-GPU dispatch; every particle runs on "
+                              "devices[0] for now regardless of how many are listed.")
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    default_device = get_compute_device()
+    devices = args.devices if args.devices is not None else [default_device]
+
+    seeds = args.seeds if args.seeds is not None else [52 + i for i in range(args.n_particles)]
+    if len(seeds) != args.n_particles:
+        raise ValueError(f"--seeds has {len(seeds)} entries but --n_particles={args.n_particles}.")
+
+    _label_extractor, num_classes, _class_names = TASK_SPECS[args.task_type]
+
+    save_dir = (
+        Path(args.save_dir) if args.save_dir is not None
+        else Path("circuits_discovered") / "hubert_circuits" / args.task_type
+    )
+
+    print(f"Loading {args.model_name} + {args.task_type} head on {devices[0]}...")
+    model = load_hubert_classifier_for_task(
+        args.task_type, head_path=args.head_path, model_name=args.model_name, device=devices[0],
+    )
+    data = load_articulatory_dataset(args.task_type, batch_size=args.batch_size)
+
+    warmup = int(0.8 * args.n_epochs)
+    discogp_config_kwargs = dict(
+        model_name=args.model_name,
+        prune_edges=True,
+        prune_weights=False,
+        n_epochs_e=args.n_epochs,
+        batch_size=args.batch_size,
+        lr_e=args.lr_e,
+        edge_logit_init_mean=args.edge_logit_init_mean,
+        edge_logit_init_std=args.edge_logit_init_std,
+        random_mode=None if args.random_mode == "none" else args.random_mode,
+        gs_temp_edge=args.gs_temp_edge,
+        lambda_sparse_e=args.lambda_sparse_e,
+        min_times_lambda_sparse_e=args.min_times_lambda_sparse_e,
+        max_times_lambda_sparse_e=args.max_times_lambda_sparse_e,
+        n_epoch_warmup_lambda_sparse_e=warmup,
+        n_epoch_cooldown_lambda_sparse_e=args.n_epochs - warmup,
+        lambda_complete_e=args.lambda_complete_e,
+        completeness_start_frac=args.completeness_start_frac,
+        overlap_penalty=False,
+    )
+
+    particles = build_particles(
+        seeds=seeds, devices=devices, model=model, discogp_config_kwargs=discogp_config_kwargs,
+    )
+
+    train_loader = fixed_order_dataloader(data.train.dataset, batch_size=args.batch_size, seed=seeds[0])
+    n_epochs = args.n_epochs
+    complete_start = int(args.completeness_start_frac * n_epochs)
+    incidence, node_keys = build_node_incidence(particles[0].discogp.masks, devices[0])
+
+    snapshot_epochs = {n_epochs - 1}
+    if args.snapshot_every:
+        snapshot_epochs |= set(range(args.snapshot_every - 1, n_epochs, args.snapshot_every))
+
+    pairs_n = max(1, args.n_particles * (args.n_particles - 1) // 2)
+
+    print(
+        f"Training {args.n_particles} particles jointly for {n_epochs} epochs "
+        f"({len(train_loader)} steps/epoch, {len(node_keys)} nodes / {incidence.shape[1]} edges "
+        f"in the full graph), task={args.task_type} ({num_classes}-way), "
+        f"lambda_edge_max={args.lambda_edge_max}, lambda_node_max={args.lambda_node_max}..."
+    )
+    t0 = time.time()
+
+    for epoch in range(n_epochs):
+        lambda_sparse_vals = [p.discogp._scheduled_lambda_sparse(mode="edge", epoch=epoch) for p in particles]
+        lambda_edge_rep = ramp_schedule(epoch, n_epochs, args.edge_repulsion_warmup_frac, args.lambda_edge_max)
+        lambda_node_rep = ramp_schedule(epoch, n_epochs, args.node_repulsion_warmup_frac, args.lambda_node_max)
+
+        epoch_task_loss = [0.0] * args.n_particles
+        epoch_edge_rep = 0.0
+        epoch_node_rep = 0.0
+        n_batches = 0
+
+        for batch in train_loader:
+            task_losses = []
+            edge_probs = []
+            for particle, lam_sparse in zip(particles, lambda_sparse_vals):
+                task_loss, probs = per_particle_forward(particle, batch, lambda_sparse=lam_sparse)
+                task_losses.append(task_loss)
+                edge_probs.append(probs)
+
+            node_probs = [node_probs_from_edge_probs(ep, incidence) for ep in edge_probs]
+            edge_rep, node_rep = combine_repulsion(
+                edge_probs, node_probs, lambda_edge=lambda_edge_rep, lambda_node=lambda_node_rep,
+            )
+
+            joint_loss = sum(task_losses) + lambda_edge_rep * edge_rep + lambda_node_rep * node_rep
+            joint_loss.backward()
+            for particle in particles:
+                per_particle_backward_step(particle)
+
+            for i, l in enumerate(task_losses):
+                epoch_task_loss[i] += l.item()
+            epoch_edge_rep += float(edge_rep)
+            epoch_node_rep += float(node_rep)
+            n_batches += 1
+
+            if epoch >= complete_start and args.lambda_complete_e > 0.0:
+                for particle in particles:
+                    run_completeness_step(
+                        particle, batch, lambda_complete=args.lambda_complete_e, num_classes=num_classes,
+                    )
+
+        print(
+            f"epoch {epoch:3d}  "
+            f"task_loss(avg/particle)={[round(l / n_batches, 4) for l in epoch_task_loss]}  "
+            f"mean_pairwise_soft_jaccard_edge={epoch_edge_rep / n_batches / pairs_n:.4f}  "
+            f"mean_pairwise_soft_jaccard_node={epoch_node_rep / n_batches / pairs_n:.4f}  "
+            f"lambda_edge={lambda_edge_rep:.3f}  lambda_node={lambda_node_rep:.3f}"
+        )
+
+        if epoch in snapshot_epochs:
+            finalize_and_report(
+                tag=f"epoch{epoch + 1}", task_type=args.task_type, particles=particles, data=data, save_dir=save_dir,
+            )
+
+    elapsed = time.time() - t0
+    print(
+        f"\nDone: {args.n_particles} {args.task_type} circuits, {n_epochs} epochs, "
+        f"{elapsed:.1f}s. Saved under {save_dir}/"
+    )
+
+
+if __name__ == "__main__":
+    main()
