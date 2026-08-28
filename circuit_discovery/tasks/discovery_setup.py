@@ -36,12 +36,13 @@ from ..algorithms.discogp import DiscoGP, DiscoGPConfig
 from ..circuit import Circuit, intersection, overlap_stats, union
 from ..metrics import evaluate_classification_accuracy
 from ..models import load_circuit_model
-from ..utils import DEVICE, set_seed
+from ..utils import pick_device, set_seed
 from .articulatory_index import TASK_SPECS, load_articulatory_dataset
 from .hubert_classifier import CircuitHubertClassifier
 from .train_classification_head import DEFAULT_HEAD_CHECKPOINT_DIR
 
 logger = logging.getLogger(__name__)
+DEVICE = pick_device()
 
 __all__ = [
     "discogp_fidelity_loss_classification",
