@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--node_repulsion_warmup_frac", type=float, default=0.8)
 
     parser.add_argument("--n_epochs", type=int, default=40)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr_e", type=float, default=0.07)
 
     parser.add_argument("--edge_logit_init_mean", type=float, default=0.1)
