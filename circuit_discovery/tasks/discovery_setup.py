@@ -277,7 +277,7 @@ def per_particle_forward(
     p = particle.discogp
     sparsity = p._sparsity_loss("edge")
     runtime_masks = p._sampled_runtime_masks_for_mode("edge")
-    logits = p.model(batch["input_ids"], runtime_masks=runtime_masks)
+    logits = p.model(batch["input_ids"], runtime_masks=runtime_masks, lengths=batch["length"].to(device=device))
     fidelity = discogp_fidelity_loss_classification(batch, logits)
     task_loss = fidelity + lambda_sparse * sparsity
     return task_loss, flat_probs(p)
@@ -315,7 +315,7 @@ def run_completeness_step(
 ) -> None:
     p = particle.discogp
     reverse_masks = p._sampled_runtime_masks_for_mode("edge", reverse=True)
-    reverse_logits = p.model(batch["input_ids"], runtime_masks=reverse_masks)
+    reverse_logits = p.model(batch["input_ids"], runtime_masks=reverse_masks, lengths=batch["length"].to(device=device))
     completeness = lambda_complete * discogp_completeness_loss_classification(batch, reverse_logits, num_classes)
     completeness.backward()
     particle.optimizer.step()
