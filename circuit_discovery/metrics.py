@@ -490,7 +490,7 @@ def evaluate_good_bad_accuracy(
     model.eval()
 
     for batch in dataloader:
-        logits = model(batch["input_ids"], circuit=circuit, lengths=batch["length"].to(device=device))
+        logits = model(batch["input_ids"], circuit=circuit)
 
         if "target bad" not in batch:
             continue
