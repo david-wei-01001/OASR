@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from .utils import pick_device
+from .utils import DEVICE
 
 import math
 from typing import Any
@@ -17,7 +17,6 @@ from .circuit import Circuit, edge_key, node_key
 from .models import CircuitModel
 
 WeightItem = tuple[node_key, str]
-DEVICE = pick_device()
 
 # --------------------------------------------------------------------------------------
 # Edge-Pruning hard-concrete / L0 helpers
@@ -489,19 +488,29 @@ def evaluate_good_bad_accuracy(
     n_total = 0
 
     model.eval()
+    # Same reasoning as evaluate_classification_accuracy above: under
+    # multi-GPU dispatch `model` may not live on the same device the
+    # dataloader's batches are pinned to.
+    model_device = getattr(model, "device_name", None)
+    if model_device is None:
+        model_device = next(model.parameters()).device
 
     for batch in dataloader:
-        logits = model(batch["input_ids"], circuit=circuit)
-
         if "target bad" not in batch:
             continue
 
-        seq_lens = batch["seq_lens"]
+        input_ids = batch["input_ids"].to(device=model_device)
+        logits = model(input_ids, circuit=circuit)
+
+        # advanced indexing below requires every index tensor on logits.device too
+        seq_lens = batch["seq_lens"].to(device=logits.device)
+        target_good = batch["target good"].to(device=logits.device)
+        target_bad = batch["target bad"].to(device=logits.device)
         cur_batch_size = logits.shape[0]
         rows = torch.arange(cur_batch_size, device=logits.device)
 
-        good = logits[rows, seq_lens - 1, batch["target good"]]
-        bad = logits[rows, seq_lens - 1, batch["target bad"]]
+        good = logits[rows, seq_lens - 1, target_good]
+        bad = logits[rows, seq_lens - 1, target_bad]
 
         n_correct += int((good > bad).sum().item())
         n_total += cur_batch_size
@@ -571,9 +580,19 @@ def evaluate_classification_accuracy(
     n_total = 0
 
     model.eval()
+    # `model` may live on any device (each particle's own, under multi-GPU
+    # dispatch), while `dataloader`'s batches are pinned to one fixed device
+    # at dataset-load time -- move each batch to model's device explicitly
+    # rather than relying on an ambient `device` name (that name was never
+    # defined in this scope and would raise NameError on first use).
+    model_device = getattr(model, "device_name", None)
+    if model_device is None:
+        model_device = next(model.parameters()).device
 
     for batch in dataloader:
-        logits = model(batch["input_ids"], circuit=circuit, lengths=batch["length"].to(device=DEVICE))
+        input_ids = batch["input_ids"].to(device=model_device)
+        lengths = batch["length"].to(device=model_device)
+        logits = model(input_ids, circuit=circuit, lengths=lengths)
         preds = logits.argmax(dim=-1)
         labels = batch["label"].to(device=logits.device)
 
