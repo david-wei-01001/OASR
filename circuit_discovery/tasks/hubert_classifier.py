@@ -189,23 +189,31 @@ class CircuitHubertClassifier(nn.Module):
     def boolean_runtime_weight_masks(self, **kwargs):
         return self.backbone.boolean_runtime_weight_masks(**kwargs)
 
-    # ---- the one method that actually differs from the backbone ----
-
     def forward(
-        self,
-        input_values: torch.Tensor,
-        circuit: Circuit | None = None,
-        *,
+        self, 
+        input_values, 
+        circuit=None, 
+        *, 
+        lengths=None, 
         runtime_masks=None,
-        edge_intervention=None,
-        return_residual: bool = False,
+        edge_intervention=None, 
+        return_residual=False
     ) -> torch.Tensor:
         hidden = self.backbone(
-            input_values,
-            circuit,
+            input_values, 
+            circuit, 
             runtime_masks=runtime_masks,
-            edge_intervention=edge_intervention,
+            edge_intervention=edge_intervention, 
             return_residual=return_residual,
         )
-        pooled = hidden.mean(dim=1)
+        
+        if lengths is not None:
+            feat_lengths = get_feat_extract_output_lengths(self.backbone.cfg, lengths.to(hidden.device))
+            seq_len = hidden.shape[1]
+            mask = torch.arange(seq_len, device=hidden.device)[None, :] < feat_lengths[:, None]
+            mask = mask.unsqueeze(-1).to(hidden.dtype)
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        else:
+            pooled = hidden.mean(dim=1)   # fallback, e.g. if `length` isn't in a batch
+            
         return self.head(pooled)
