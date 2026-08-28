@@ -212,6 +212,8 @@ def main() -> None:
         lambda_node_rep = ramp_schedule(epoch, n_epochs, args.node_repulsion_warmup_frac, args.lambda_node_max)
 
         epoch_task_loss = [0.0] * args.n_particles
+        epoch_correct = [0] * args.n_particles
+        epoch_total = 0
         epoch_edge_rep = 0.0
         epoch_node_rep = 0.0
         n_batches = 0
@@ -222,10 +224,14 @@ def main() -> None:
             # Each particle's forward runs on its own device -- issuing them
             # back to back here lets their CUDA kernels queue and overlap
             # across devices (see multi_particle.py's module docstring).
-            for particle, lam_sparse in zip(particles, lambda_sparse_vals):
-                task_loss, probs = per_particle_forward(particle, batch, lambda_sparse=lam_sparse)
+            for i, (particle, lam_sparse) in enumerate(zip(particles, lambda_sparse_vals)):
+                task_loss, probs, logits = per_particle_forward(particle, batch, lambda_sparse=lam_sparse)
                 task_losses.append(task_loss)
                 edge_probs.append(probs)
+                preds = logits.detach().argmax(dim=-1)
+                labels = batch["label"].to(device=logits.device)
+                epoch_correct[i] += (preds == labels).sum().item()
+            epoch_total += batch["label"].shape[0]
 
             node_probs = [
                 node_probs_from_edge_probs(ep, incidence_by_device[str(ep.device)])
@@ -264,9 +270,10 @@ def main() -> None:
 
         print(
             f"epoch {epoch:3d}  "
-            f"task_loss(avg/particle)={[round(l / n_batches, 4) for l in epoch_task_loss]}  "
-            f"mean_pairwise_soft_jaccard_edge={epoch_edge_rep / n_batches / pairs_n:.4f}  "
-            f"mean_pairwise_soft_jaccard_node={epoch_node_rep / n_batches / pairs_n:.4f}  "
+            f"loss={[round(l / n_batches, 4) for l in epoch_task_loss]}  "
+            f"train_acc={[round(c / epoch_total, 4) for c in epoch_correct]}  "
+            f"jaccard_edge={epoch_edge_rep / n_batches / pairs_n:.4f}  "
+            f"jaccard_node={epoch_node_rep / n_batches / pairs_n:.4f}  "
             f"lambda_edge={lambda_edge_rep:.3f}  lambda_node={lambda_node_rep:.3f}"
         )
 
