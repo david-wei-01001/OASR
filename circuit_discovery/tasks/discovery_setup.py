@@ -12,18 +12,28 @@ This is a library module, not a script. run_hubert.py (repo root) is the CLI
 entrypoint that imports from here. Kept separate for two reasons:
   1. the loss/repulsion math and the particle bookkeeping are reusable and
      testable outside argument parsing.
-  2. future multi-GPU/multi-process dispatch has one place to change --
-     see the note above `Particle` below -- rather than being tangled into
-     a CLI script.
+  2. multi-GPU/multi-process dispatch has one place to change -- see
+     circuit_discovery/multi_particle.py, which this module now delegates
+     the device-agnostic repulsion/dispatch math to.
 
-Nothing here modifies circuit.py, algorithms/*.py, models/*, run.py,
-metrics.py, or configs.yaml. Existing GPT2/IOI infrastructure, and the
-existing pilotN.py scripts, are untouched.
+Multi-GPU: IMPLEMENTED (single-process; see multi_particle.py's module
+docstring for the design). Each particle is assigned a device round-robin
+over `--devices`; each unique device gets its own frozen model replica
+(backbone+head are frozen, so replicating them costs memory, not
+correctness); combine_repulsion is the synchronization point where every
+particle's edge/node probabilities get moved to one `--repulsion_device`
+before the pairwise soft-Jaccard terms.
+
+Nothing here modifies circuit.py, algorithms/*.py, models/*, run.py, or
+configs.yaml. metrics.py had one bug fixed (see below) plus a
+multi-device-safety fix to evaluate_classification_accuracy; everything else
+there is untouched. Existing GPT2/IOI infrastructure and the pilotN.py
+scripts are untouched -- see circuit_discovery/ioi_discovery_setup.py for
+the GPT2/IOI analogue of this file, which shares multi_particle.py with it.
 """
 
 from __future__ import annotations
 
-import itertools
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,13 +46,23 @@ from ..algorithms.discogp import DiscoGP, DiscoGPConfig
 from ..circuit import Circuit, intersection, overlap_stats, union
 from ..metrics import evaluate_classification_accuracy
 from ..models import load_circuit_model
-from ..utils import pick_device, set_seed
+from ..multi_particle import (
+    assign_devices,
+    build_node_incidence,
+    build_node_incidence_for_devices,
+    combine_repulsion,
+    flat_probs,
+    move_batch_to_device,
+    node_probs_from_edge_probs,
+    ramp_schedule,
+    soft_jaccard,
+)
+from ..utils import DEVICE, set_seed
 from .articulatory_index import TASK_SPECS, load_articulatory_dataset
 from .hubert_classifier import CircuitHubertClassifier
 from .train_classification_head import DEFAULT_HEAD_CHECKPOINT_DIR
 
 logger = logging.getLogger(__name__)
-DEVICE = pick_device()
 
 __all__ = [
     "discogp_fidelity_loss_classification",
@@ -50,11 +70,17 @@ __all__ = [
     "evaluate_circuit_classification",
     "default_head_path",
     "load_hubert_classifier_for_task",
+    "load_hubert_classifiers_for_devices",
+    # re-exported from multi_particle for anyone importing them from here,
+    # matching this module's pre-refactor public surface
     "flat_probs",
     "soft_jaccard",
     "build_node_incidence",
+    "build_node_incidence_for_devices",
     "node_probs_from_edge_probs",
     "ramp_schedule",
+    "assign_devices",
+    "move_batch_to_device",
     "Particle",
     "build_particles",
     "per_particle_forward",
@@ -134,93 +160,45 @@ def load_hubert_classifier_for_task(
     classifier.eval()
     return classifier
 
-# --------------------------------------------------------------------------------------
-# repulsion math
-# --------------------------------------------------------------------------------------
-# Architecture-agnostic: only touches masks.edge_logits / masks.edge_logit_keys,
-# which DiscoGPMasks populates via CircuitModel.edge_logit_group_specs -- this
-# is identical code to pilot2b.py's, unchanged, because CircuitHubertClassifier
-# delegates edge_logit_group_specs straight to the CircuitHubert backbone.
 
-
-def flat_probs(runner: DiscoGP) -> torch.Tensor:
-    return torch.cat([torch.sigmoid(p).reshape(-1) for p in runner.masks.edge_logits])
-
-
-def soft_jaccard(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    inter = (p * q).sum()
-    union_ = (p + q - p * q).sum()
-    return inter / (union_ + eps)
-
-
-def build_node_incidence(masks: Any, device: str) -> tuple[torch.Tensor, list]:
-    """(n_nodes, n_edges) 0/1 matrix; row i, col j = 1 if edge j touches node i.
-    Built once from mask structure (identical across particles, since every
-    particle is instantiated from the same frozen model + base circuit)."""
-    all_edge_keys = [key for keys in masks.edge_logit_keys for key in keys]
-    node_keys = sorted({n for pair in all_edge_keys for n in pair})
-    node_index = {n: i for i, n in enumerate(node_keys)}
-    incidence = torch.zeros(len(node_keys), len(all_edge_keys), device=device)
-    for e_idx, (dst_key, src_key) in enumerate(all_edge_keys):
-        incidence[node_index[dst_key], e_idx] = 1.0
-        incidence[node_index[src_key], e_idx] = 1.0
-    return incidence, node_keys
-
-
-def node_probs_from_edge_probs(edge_probs: torch.Tensor, incidence: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Noisy-OR / probabilistic union: p_node = 1 - prod(1 - p_e) over
-    incident edges, computed in log-space for stability."""
-    log1m = torch.log1p(-edge_probs.clamp(max=1 - eps))
-    node_log1m_sum = incidence @ log1m
-    return 1 - torch.exp(node_log1m_sum)
-
-
-def ramp_schedule(epoch: int, n_epochs: int, warmup_frac: float, lambda_max: float) -> float:
-    """Linear ramp 0 -> lambda_max over the first warmup_frac of training,
-    then held constant. lambda_max=0.0 is how a repulsion term gets turned
-    off entirely -- there's deliberately no separate on/off flag."""
-    if lambda_max == 0.0:
-        return 0.0
-    warmup_epochs = max(1, int(warmup_frac * n_epochs))
-    if epoch >= warmup_epochs:
-        return lambda_max
-    return lambda_max * (epoch / warmup_epochs)
+def load_hubert_classifiers_for_devices(
+    task_type: str,
+    devices: list[str],
+    *,
+    head_path: str | Path | None = None,
+    model_name: str = "hubert-base-ls960",
+) -> dict[str, CircuitHubertClassifier]:
+    """One frozen backbone+head replica per unique device, for multi-GPU
+    dispatch. Backbone and head are frozen (no gradients ever flow into
+    them, see CircuitHubertClassifier.freeze_all) -- replicating them across
+    devices is a memory cost only, never a training-correctness concern.
+    Each replica is loaded independently via load_hubert_classifier_for_task
+    (rather than e.g. deep-copying one CPU instance) since that's the
+    simplest way to get correct device placement for every buffer/parameter
+    without hunting down anything the deep-copy path might miss."""
+    return {
+        device: load_hubert_classifier_for_task(
+            task_type, head_path=head_path, model_name=model_name, device=device,
+        )
+        for device in dict.fromkeys(devices)  # de-duplicate, keep first-seen order
+    }
 
 # --------------------------------------------------------------------------------------
 # particle bookkeeping
 # --------------------------------------------------------------------------------------
-# Not parallel yet -- this is the seam left for it.
+# Multi-GPU dispatch: IMPLEMENTED. See circuit_discovery/multi_particle.py's
+# module docstring for the full design; short version:
 #
-# Training one joint step decomposes into three phases, kept as separate
-# functions specifically so a future dispatcher can change *how* each phase
-# runs without touching the loss/repulsion math itself:
-#
-#   per_particle_forward     -- independent per particle, embarrassingly
-#                                parallel (one particle's forward+loss
-#                                doesn't depend on any other's).
-#   combine_repulsion        -- needs every particle's edge/node probs at
-#                                once. This is the natural synchronization /
-#                                all-gather boundary for a future
-#                                multi-process or multi-GPU implementation.
+#   per_particle_forward     -- runs entirely on particle.device. Independent
+#                                across particles -- CUDA ops on different
+#                                devices queue and overlap without any
+#                                explicit parallelism construct needed.
+#   combine_repulsion        -- the synchronization point (in
+#                                multi_particle.py): every particle's
+#                                edge/node probs get moved to one
+#                                `hub_device` first.
 #   per_particle_backward_step -- independent again, one optimizer step per
-#                                particle.
-#
-# `Particle.device` already exists so a per-particle device assignment is
-# threaded through today, even though every particle actually runs on the
-# same device for now (see build_particles). Two things worth knowing before
-# actually parallelizing this, so they don't surprise whoever picks it up:
-#   1. Single-process multi-GPU (each particle's parameters/buffers placed on
-#      a different `cuda:i`, still one Python process) is a smaller step than
-#      it looks -- PyTorch already dispatches ops to whatever device a
-#      tensor lives on, so this doesn't strictly require multiprocessing.
-#      combine_repulsion's soft_jaccard calls would just need every
-#      edge_probs[i]/node_probs[i] moved to one common device first, since
-#      elementwise ops across tensors on different devices error.
-#   2. Batches are currently pinned to `utils.DEVICE` at dataset-load time
-#      (`load_articulatory_dataset` -> `.with_format("torch", ...,
-#      device=DEVICE)`), not per-`--devices` entry -- true per-GPU particles
-#      will need their own `.to(particle.device)` copy of each batch, or a
-#      per-device dataloader.
+#                                particle, on that particle's own device.
 
 
 @dataclass
@@ -239,28 +217,33 @@ def build_particles(
     *,
     seeds: list[int],
     devices: list[str],
-    model: CircuitHubertClassifier,
+    models_by_device: dict[str, CircuitHubertClassifier],
     discogp_config_kwargs: dict[str, Any],
 ) -> list[Particle]:
     """
-    All particles currently share one `model` instance/device: backbone and
-    head are frozen, so this is safe -- only each particle's own
-    masks.edge_logits differ. `devices` is accepted and validated here so a
-    future per-device model-replica change is localized to this function.
+    Each particle is assigned a device round-robin over `devices` (see
+    multi_particle.assign_devices) and uses that device's frozen model
+    replica from `models_by_device` (see load_hubert_classifiers_for_devices).
+    Every particle still gets its own DiscoGP / DiscoGPMasks -- i.e. its own
+    edge_logits nn.Parameters and its own optimizer -- only the frozen
+    backbone+head is shared *within* a device across the particles placed
+    there.
     """
-    if len(set(devices)) > 1:
-        logger.warning(
-            "multiple devices requested (%s) but multi-device dispatch isn't "
-            "implemented yet -- running every particle on %s for now.",
-            devices, devices[0],
+    particle_devices = assign_devices(len(seeds), devices)
+    missing = {d for d in particle_devices if d not in models_by_device}
+    if missing:
+        raise ValueError(
+            f"models_by_device is missing replicas for device(s) {sorted(missing)}; "
+            f"pass every entry of `devices` through load_hubert_classifiers_for_devices."
         )
 
     particles: list[Particle] = []
-    for seed in seeds:
+    for seed, device in zip(seeds, particle_devices):
         set_seed(seed)
+        model = models_by_device[device]
         cfg = DiscoGPConfig(**discogp_config_kwargs)
-        discogp = DiscoGP(model=model, config=cfg, device=devices[0])
-        particles.append(Particle(seed=seed, device=devices[0], model=model, discogp=discogp))
+        discogp = DiscoGP(model=model, config=cfg, device=device)
+        particles.append(Particle(seed=seed, device=device, model=model, discogp=discogp))
     return particles
 
 # --------------------------------------------------------------------------------------
@@ -274,32 +257,19 @@ def per_particle_forward(
     *,
     lambda_sparse: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns (task_loss, edge_probs) for one particle on one batch."""
+    """Returns (task_loss, edge_probs) for one particle on one batch, both on
+    particle.device. Batches arrive pinned to one fixed device (dataset-load
+    time), so every call moves its own copy onto particle.device first --
+    this is also where the old `device` NameError bug lived (it referenced
+    an undefined bare name instead of particle.device)."""
     p = particle.discogp
+    batch = move_batch_to_device(batch, particle.device)
     sparsity = p._sparsity_loss("edge")
     runtime_masks = p._sampled_runtime_masks_for_mode("edge")
-    logits = p.model(batch["input_ids"], runtime_masks=runtime_masks, lengths=batch["length"].to(device=DEVICE))
+    logits = p.model(batch["input_ids"], runtime_masks=runtime_masks, lengths=batch["length"])
     fidelity = discogp_fidelity_loss_classification(batch, logits)
     task_loss = fidelity + lambda_sparse * sparsity
     return task_loss, flat_probs(p)
-
-
-def combine_repulsion(
-    edge_probs: list[torch.Tensor],
-    node_probs: list[torch.Tensor],
-    *,
-    lambda_edge: float,
-    lambda_node: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sum of pairwise soft-Jaccard over all particle pairs, for edges and
-    for nodes. Returns zero tensors (not skipped) when a lambda is 0, so
-    callers can log the raw repulsion value even with that term switched off."""
-    pairs = list(itertools.combinations(range(len(edge_probs)), 2))
-    device = edge_probs[0].device
-
-    edge_rep = sum((soft_jaccard(edge_probs[i], edge_probs[j]) for i, j in pairs), torch.zeros((), device=device))
-    node_rep = sum((soft_jaccard(node_probs[i], node_probs[j]) for i, j in pairs), torch.zeros((), device=device))
-    return edge_rep, node_rep
 
 
 def per_particle_backward_step(particle: Particle) -> None:
@@ -315,8 +285,9 @@ def run_completeness_step(
     num_classes: int,
 ) -> None:
     p = particle.discogp
+    batch = move_batch_to_device(batch, particle.device)
     reverse_masks = p._sampled_runtime_masks_for_mode("edge", reverse=True)
-    reverse_logits = p.model(batch["input_ids"], runtime_masks=reverse_masks, lengths=batch["length"].to(device=DEVICE))
+    reverse_logits = p.model(batch["input_ids"], runtime_masks=reverse_masks, lengths=batch["length"])
     completeness = lambda_complete * discogp_completeness_loss_classification(batch, reverse_logits, num_classes)
     completeness.backward()
     particle.optimizer.step()
@@ -343,6 +314,9 @@ def finalize_and_report(
         p = particle.discogp
         circuit = p.masks.boolean_circuit(use_edges=True, use_weights=False)
         circuit = p.model.finalize_circuit(circuit)
+        # evaluate_circuit_classification -> evaluate_classification_accuracy now
+        # moves its own batches to p.model's device internally, so this is
+        # multi-GPU safe even though `data.test` is one shared dataloader.
         evaluation = evaluate_circuit_classification(p.model, data.test, circuit)
         name = f"{tag}_seed_{particle.seed}"
         circuits[name] = circuit
@@ -351,7 +325,7 @@ def finalize_and_report(
             save_dir / f"{task_type}_{name}.pt",
         )
         print(
-            f"{name}: acc={evaluation.get('acc')}, "
+            f"{name} (device={particle.device}): acc={evaluation.get('acc')}, "
             f"kept_edges={circuit.num_kept_edges()}, "
             f"edge_density={circuit.edge_density():.4f}"
         )
