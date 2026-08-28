@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from .utils import DEVICE
+from .utils import pick_device
 
 import math
 from typing import Any
@@ -17,6 +17,7 @@ from .circuit import Circuit, edge_key, node_key
 from .models import CircuitModel
 
 WeightItem = tuple[node_key, str]
+DEVICE = pick_device()
 
 # --------------------------------------------------------------------------------------
 # Edge-Pruning hard-concrete / L0 helpers
