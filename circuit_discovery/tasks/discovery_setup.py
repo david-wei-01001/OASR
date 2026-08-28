@@ -256,12 +256,12 @@ def per_particle_forward(
     batch: dict[str, Any],
     *,
     lambda_sparse: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns (task_loss, edge_probs) for one particle on one batch, both on
-    particle.device. Batches arrive pinned to one fixed device (dataset-load
-    time), so every call moves its own copy onto particle.device first --
-    this is also where the old `device` NameError bug lived (it referenced
-    an undefined bare name instead of particle.device)."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns (task_loss, edge_probs, logits) for one particle on one batch,
+    all on particle.device. ...
+    logits is returned (not just consumed internally for
+    the loss) so callers can compute train accuracy without a second,
+    redundant forward pass."""
     p = particle.discogp
     batch = move_batch_to_device(batch, particle.device)
     sparsity = p._sparsity_loss("edge")
@@ -269,8 +269,8 @@ def per_particle_forward(
     logits = p.model(batch["input_ids"], runtime_masks=runtime_masks, lengths=batch["length"])
     fidelity = discogp_fidelity_loss_classification(batch, logits)
     task_loss = fidelity + lambda_sparse * sparsity
-    return task_loss, flat_probs(p)
-
+    return task_loss, flat_probs(p), logits
+  
 
 def per_particle_backward_step(particle: Particle) -> None:
     particle.optimizer.step()
