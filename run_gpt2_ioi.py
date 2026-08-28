@@ -1,49 +1,46 @@
 #!/usr/bin/env python3
 """
-run_hubert.py
+run_gpt2_ioi.py
 
 CLI entrypoint for OASR-style joint multi-particle circuit discovery --
 edge repulsion AND node repulsion applied simultaneously to N particles
 trained together in one loop, not the sequential find-a-circuit-then-repel-
-from-it pattern -- against a CircuitHubert backbone plus a frozen, already-
-trained classification head, on one Articulatory Index task per run.
+from-it pattern of pilot1.py/pilot2.py -- against a CircuitGPT (gpt2-small /
+gpt2-medium) backbone on the IOI task.
 
-Run from the OASR repo root, after:
-  1. Building the task's dataset:
-       from circuit_discovery.tasks.articulatory_index import prepare_and_save_articulatory_dataset
-       prepare_and_save_articulatory_dataset("vowel_classification", data_dir=DATA_DIR)
-       prepare_and_save_articulatory_dataset("consonant_classification", data_dir=DATA_DIR)
-  2. Training and saving that task's head:
-       python -m circuit_discovery.tasks.train_classification_head --task_type vowel_classification
-       python -m circuit_discovery.tasks.train_classification_head --task_type consonant_classification
+This is the direct GPT2/IOI analogue of run_hubert.py. It imports its
+particle/repulsion logic from circuit_discovery/ioi_discovery_setup.py
+exactly the way run_hubert.py imports from
+circuit_discovery/tasks/discovery_setup.py -- both delegate the
+architecture-agnostic repulsion math and multi-GPU dispatch to
+circuit_discovery/multi_particle.py.
+
+Run from the OASR repo root. Unlike HuBERT's Articulatory Index tasks, IOI
+needs no separate dataset-prep or head-training step first -- utils.py's
+load_task_dataset loads the existing saved `ioi_dataset` directly.
 
 Examples:
-    python run_hubert.py --task_type vowel_classification
-    python run_hubert.py --task_type consonant_classification \\
-        --n_particles 3 --lambda_edge_max 0.66 --lambda_node_max 10.0
+    python run_gpt2_ioi.py
+    python run_gpt2_ioi.py --n_particles 3 --lambda_edge_max 0.66 --lambda_node_max 10.0
 
     # spread 6 particles round-robin over two GPUs, combine repulsion on cuda:0
-    python run_hubert.py --task_type vowel_classification \\
+    python run_gpt2_ioi.py \\
         --n_particles 6 --devices cuda:0 cuda:1 --repulsion_device cuda:0
 
 Turning a repulsion term off: pass --lambda_edge_max 0 or --lambda_node_max 0.
 The ramp schedule returns 0 for the whole run in that case -- there's no
 separate --disable_* flag, one fewer thing to keep in sync.
 
-Run the two tasks as two independent invocations (as designed): this script
-discovers N mutually-repelling circuits for ONE task at a time. It does not
-run vowel and consonant particles against each other.
-
-Parallelism: IMPLEMENTED (single-process multi-GPU). --devices takes one or
-more device strings; particles are assigned round-robin across them, each
-unique device gets its own frozen model replica, and --repulsion_device
-picks where the cross-particle edge/node repulsion terms get combined each
-step (defaults to devices[0]). See
-circuit_discovery/multi_particle.py's module docstring for the design and
-circuit_discovery/tasks/discovery_setup.py's Particle /
+Parallelism: IMPLEMENTED (single-process multi-GPU), identical design to
+run_hubert.py. --devices takes one or more device strings; particles are
+assigned round-robin across them, each unique device gets its own frozen
+CircuitGPT replica, and --repulsion_device picks where the cross-particle
+edge/node repulsion terms get combined each step (defaults to devices[0]).
+See circuit_discovery/multi_particle.py's module docstring for the design
+and circuit_discovery/ioi_discovery_setup.py's Particle /
 per_particle_forward / combine_repulsion / per_particle_backward_step split
 for exactly how each phase runs. With a single device (the default) this is
-behaviorally identical to the old single-GPU code path.
+behaviorally identical to the old single-GPU pilot2b.py-style code path.
 """
 
 from __future__ import annotations
@@ -52,21 +49,20 @@ import argparse
 import time
 from pathlib import Path
 
-from circuit_discovery.run import get_compute_device
-from circuit_discovery.tasks.articulatory_index import TASK_SPECS, load_articulatory_dataset
-from circuit_discovery.tasks.discovery_setup import (
+from circuit_discovery.ioi_discovery_setup import (
     build_node_incidence_for_devices,
     build_particles,
     combine_repulsion,
     finalize_and_report,
-    load_hubert_classifiers_for_devices,
+    load_gpt2_for_devices,
     node_probs_from_edge_probs,
     per_particle_backward_step,
     per_particle_forward,
     ramp_schedule,
     run_completeness_step,
 )
-from circuit_discovery.utils import fixed_order_dataloader
+from circuit_discovery.run import get_compute_device
+from circuit_discovery.utils import fixed_order_dataloader, load_task_dataset
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,19 +70,16 @@ def parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
-    parser.add_argument(
-        "--task_type", required=True, choices=sorted(TASK_SPECS),
-        help="which Articulatory Index task to discover circuits for (one task per run).",
-    )
-    parser.add_argument("--model_name", default="hubert-base-ls960",
-                         choices=["hubert-base-ls960", "wav2vec2-base-960h", "wav2vec2-base"])
-    parser.add_argument("--head_path", default=None,
-                         help="defaults to circuit_discovery/trained_heads/{task_type}_head.pt")
+    parser.add_argument("--model_name", default="gpt2-small", choices=["gpt2-small", "gpt2-medium"])
+    parser.add_argument("--task", default="ioi", help="dataset name under DATASET_FOLDER_PATH, e.g. 'ioi'.")
+    parser.add_argument("--train_size", type=int, default=5000)
+    parser.add_argument("--test_size", type=int, default=1000)
+    parser.add_argument("--data_seed", type=int, default=42)
 
     parser.add_argument("--n_particles", type=int, default=3,
                          help="how many mutually-repelling circuits to discover simultaneously.")
     parser.add_argument("--seeds", type=int, nargs="+", default=None,
-                         help="one seed per particle; defaults to [52, 53, 54, ...] up to n_particles.")
+                         help="one seed per particle; defaults to [42, 43, 44, ...] up to n_particles.")
 
     parser.add_argument("--lambda_edge_max", type=float, default=0.66,
                          help="max strength of pairwise edge-probability repulsion. 0 disables it.")
@@ -114,7 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshot_every", type=int, default=None,
                          help="also snapshot circuits every N epochs, not just at the end (useful for long runs).")
     parser.add_argument("--save_dir", default=None,
-                         help="defaults to circuits_discovered/hubert_circuits/{task_type}/")
+                         help="defaults to circuits_discovered/ioi_circuits/{model_name}/")
 
     parser.add_argument("--devices", nargs="+", default=None,
                          help="one or more devices (e.g. --devices cuda:0 cuda:1). Particles are "
@@ -133,24 +126,21 @@ def main() -> None:
     devices = args.devices if args.devices is not None else [default_device]
     hub_device = args.repulsion_device or devices[0]
 
-    seeds = args.seeds if args.seeds is not None else [52 + i for i in range(args.n_particles)]
+    seeds = args.seeds if args.seeds is not None else [42 + i for i in range(args.n_particles)]
     if len(seeds) != args.n_particles:
         raise ValueError(f"--seeds has {len(seeds)} entries but --n_particles={args.n_particles}.")
 
-    _label_extractor, num_classes, _class_names = TASK_SPECS[args.task_type]
-
     save_dir = (
         Path(args.save_dir) if args.save_dir is not None
-        else Path("circuits_discovered") / "hubert_circuits" / args.task_type
+        else Path("circuits_discovered") / "ioi_circuits" / args.model_name
     )
 
-    print(
-        f"Loading {args.model_name} + {args.task_type} head, one replica per device in {sorted(set(devices))}..."
+    print(f"Loading {args.model_name}, one replica per device in {sorted(set(devices))}...")
+    models_by_device = load_gpt2_for_devices(args.model_name, devices)
+    data = load_task_dataset(
+        args.task, batch_size=args.batch_size, train_size=args.train_size,
+        test_size=args.test_size, random_seed=args.data_seed,
     )
-    models_by_device = load_hubert_classifiers_for_devices(
-        args.task_type, devices, head_path=args.head_path, model_name=args.model_name,
-    )
-    data = load_articulatory_dataset(args.task_type, batch_size=args.batch_size)
 
     warmup = int(0.8 * args.n_epochs)
     discogp_config_kwargs = dict(
@@ -200,7 +190,7 @@ def main() -> None:
     print(
         f"Training {args.n_particles} particles jointly for {n_epochs} epochs "
         f"({len(train_loader)} steps/epoch, {len(node_keys)} nodes / {incidence_by_device[devices[0]].shape[1]} "
-        f"edges in the full graph), task={args.task_type} ({num_classes}-way), "
+        f"edges in the full graph), task={args.task} on {args.model_name}, "
         f"lambda_edge_max={args.lambda_edge_max}, lambda_node_max={args.lambda_node_max}, "
         f"devices={sorted(set(devices))}, repulsion_device={hub_device}..."
     )
@@ -259,7 +249,7 @@ def main() -> None:
             if epoch >= complete_start and args.lambda_complete_e > 0.0:
                 for particle in particles:
                     run_completeness_step(
-                        particle, batch, lambda_complete=args.lambda_complete_e, num_classes=num_classes,
+                        particle, batch, lambda_complete=args.lambda_complete_e,
                     )
 
         print(
@@ -272,12 +262,12 @@ def main() -> None:
 
         if epoch in snapshot_epochs:
             finalize_and_report(
-                tag=f"epoch{epoch + 1}", task_type=args.task_type, particles=particles, data=data, save_dir=save_dir,
+                tag=f"epoch{epoch + 1}", particles=particles, data=data, save_dir=save_dir,
             )
 
     elapsed = time.time() - t0
     print(
-        f"\nDone: {args.n_particles} {args.task_type} circuits, {n_epochs} epochs, "
+        f"\nDone: {args.n_particles} IOI circuits on {args.model_name}, {n_epochs} epochs, "
         f"{elapsed:.1f}s. Saved under {save_dir}/"
     )
 

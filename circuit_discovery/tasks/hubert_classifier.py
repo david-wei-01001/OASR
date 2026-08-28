@@ -17,15 +17,15 @@ weight_logit_group_specs, sample_runtime_masks, boolean_runtime_weight_masks)
 is a pure delegation to the wrapped backbone -- the wrapper adds no new nodes
 or edges of its own.
 
-Pooling: mean over the time axis, unmasked. Because the dataset pads every
-clip to one fixed sample count (see articulatory_index.py) rather than
-padding a batch to its own max length, there's no attention_mask to route
-through the conv stack's frame-count reduction here -- padded silence at the
-tail of longer clips gets averaged in along with real signal. That's an
-accepted simplification for a first pass (isolated syllables are short and
-similarly sized, so the dilution is small); if it turns out to matter, the
-fix is to also carry each clip's true frame count through and mask before
-pooling, not to change anything here about how CircuitHubert itself works.
+Pooling: masked mean over the time axis. The dataset pads every clip to one
+fixed sample count (see articulatory_index.py) and stores each clip's true
+pre-padding sample length alongside it in a `length` column. `forward`
+converts that raw-sample length into a conv-output-frame length via
+get_feat_extract_output_lengths (mirrors HF's
+Wav2Vec2Model._get_feat_extract_output_lengths) and masks the padded frames
+out before averaging, so padding never dilutes the pooled vector. When
+`lengths` isn't passed (e.g. a caller building a batch without the `length`
+column), forward falls back to an unmasked mean over all frames.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ import torch.nn as nn
 from ..circuit import Circuit, edge_key, node_key
 from .. import utils as _utils
 from ..utils import pick_device
+from ..models.modeling_hubert import get_feat_extract_output_lengths
 
 DEVICE = pick_device()
 print(DEVICE)
