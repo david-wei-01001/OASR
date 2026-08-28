@@ -147,6 +147,8 @@ class HubertCircuitConfig:
     layer_norm_eps: float
     hidden_act: str
     arch_name: str
+    conv_kernel: list[int]
+    conv_stride: list[int]
 
 
 # --------------------------------------------------------------------------------------
@@ -236,6 +238,13 @@ def hubert_src_keys_before_layer(cfg: HubertCircuitConfig, layer_id: int) -> lis
         keys.append((layer, 0, "ln2_bias"))
 
     return keys
+
+
+def get_feat_extract_output_lengths(cfg: "HubertCircuitConfig", input_lengths: torch.Tensor) -> torch.Tensor:
+    lengths = input_lengths
+    for kernel_size, stride in zip(cfg.conv_kernel, cfg.conv_stride):
+        lengths = torch.div(lengths - kernel_size, stride, rounding_mode="floor") + 1
+    return lengths
 
 
 def build_full_hubert_circuit(cfg: HubertCircuitConfig) -> Circuit:
@@ -1214,6 +1223,8 @@ class CircuitHubert(nn.Module):
             layer_norm_eps=hf_cfg.layer_norm_eps,
             hidden_act=hf_cfg.hidden_act if isinstance(hf_cfg.hidden_act, str) else "gelu",
             arch_name=model_name,
+            conv_kernel=list(hf_cfg.conv_kernel),
+            conv_stride=list(hf_cfg.conv_stride),
         )
 
         preprocessor = FrozenSpeechPreprocessor(hf_root).to(device=device)
@@ -1275,6 +1286,7 @@ class CircuitHubert(nn.Module):
             block.mlp.b_in.copy_(hf_layer.feed_forward.intermediate_dense.bias.data)
             block.mlp.W_out.copy_(hf_layer.feed_forward.output_dense.weight.data.t())
             block.mlp.b_out.copy_(hf_layer.feed_forward.output_dense.bias.data)
+            
 
 
 __all__ = [
@@ -1284,4 +1296,5 @@ __all__ = [
     "build_full_hubert_circuit",
     "finalize_hubert_circuit",
     "decompose_post_layer_norm",
+    "get_feat_extract_output_lengths",
 ]
