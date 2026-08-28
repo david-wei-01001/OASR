@@ -252,8 +252,8 @@ def main() -> None:
 
             for i, l in enumerate(task_losses):
                 epoch_task_loss[i] += l.item()
-            epoch_edge_rep += float(edge_rep)
-            epoch_node_rep += float(node_rep)
+            epoch_edge_rep += edge_rep.detach().item()
+            epoch_node_rep += node_rep.detach().item()
             n_batches += 1
 
             if epoch >= complete_start and args.lambda_complete_e > 0.0:
