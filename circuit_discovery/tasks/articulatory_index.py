@@ -403,6 +403,7 @@ def prepare_and_save_articulatory_dataset(
 
     def _to_fixed_length(example):
         arr = np.asarray(example["audio_path"]["array"], dtype=np.float32)
+        true_len = min(arr.shape[0], max_len)   # after any truncation
         if arr.shape[0] > max_len:
             arr = arr[:max_len]
         if normalize:
@@ -411,8 +412,8 @@ def prepare_and_save_articulatory_dataset(
                 arr = (arr - arr.mean()) / std
         if arr.shape[0] < max_len:
             arr = np.pad(arr, (0, max_len - arr.shape[0]))
-        return {"input_ids": arr}
-
+        return {"input_ids": arr, "length": true_len}
+        
     ds = ds.map(_to_fixed_length, remove_columns=["audio_path"], desc=f"pad/normalize ({task_type})")
     ds = ds.cast_column("label", ClassLabel(num_classes=num_classes, names=class_names))
 
