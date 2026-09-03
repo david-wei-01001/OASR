@@ -44,13 +44,42 @@ circuit_discovery/tasks/discovery_setup.py's Particle /
 per_particle_forward / combine_repulsion / per_particle_backward_step split
 for exactly how each phase runs. With a single device (the default) this is
 behaviorally identical to the old single-GPU code path.
+
+Each epoch also prints edge_density: per particle, the fraction of edges
+currently kept (sigmoid(edge_logit) > 0.5 -- same threshold convention as
+DiscoGP's own hard=(logits>0).float() straight-through mask) out of the
+full graph's edge count. This is the SAME quantity pilot_hubert.py and
+run_hubert_sequential.py already log, added here so the joint run can be
+read the same way: is a particle's accuracy dropping because the task is
+genuinely failing, or because its circuit is shrinking out from under it?
+Distinct from the soft/relaxed density used inside the sparsity loss itself.
+
+EPOCH SNAPSHOTS: every --epoch_snapshot_every epochs, ALL --n_particles
+circuits from that epoch are each saved to
+    {save_dir}/particle{i}_epoch_snapshots/epoch{N:03d}.pt
+containing {epoch, train_acc, loss, edge_density, jaccard_edge,
+jaccard_node, edge_probs} -- the same format pilot_hubert.py and
+run_hubert_sequential.py already write (edge_probs = flat_probs(p) =
+sigmoid(edge_logits), deterministic, computed once per particle per epoch
+after the batch loop -- not a mid-epoch batch sample), so these files are
+directly usable by compare_circuits.py or as --load_frozen inputs to
+run_hubert_sequential.py, no reconstruction needed. jaccard_edge/jaccard_node
+here are this epoch's OVERALL (all-pairs) repulsion values, same numbers
+already in the printed line -- identical across every particle's snapshot
+for a given epoch, since that's a property of the whole cohort, not any one
+particle; kept per-file anyway so each snapshot is self-contained. A
+scalars-only summary.json per particle (no tensors) is rewritten every
+epoch for quick scanning.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
+
+import torch
 
 from circuit_discovery.run import get_compute_device
 from circuit_discovery.tasks.articulatory_index import TASK_SPECS, load_articulatory_dataset
@@ -59,6 +88,7 @@ from circuit_discovery.tasks.discovery_setup import (
     build_particles,
     combine_repulsion,
     finalize_and_report,
+    flat_probs,
     load_hubert_classifiers_for_devices,
     node_probs_from_edge_probs,
     per_particle_backward_step,
@@ -90,8 +120,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--lambda_edge_max", type=float, default=0.66,
                          help="max strength of pairwise edge-probability repulsion. 0 disables it.")
-    parser.add_argument("--edge_repulsion_warmup_frac", type=float, default=0.8)
-    parser.add_argument("--lambda_node_max", type=float, default=10.0,
+    parser.add_argument("--edge_repulsion_warmup_frac", type=float, default=0.8) 
+    parser.add_argument("--lambda_node_max", type=float, default=0.0,
                          help="max strength of pairwise node-probability (noisy-OR) repulsion. 0 disables it.")
     parser.add_argument("--node_repulsion_warmup_frac", type=float, default=0.8)
 
@@ -99,21 +129,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr_e", type=float, default=0.07)
 
-    parser.add_argument("--edge_logit_init_mean", type=float, default=0.1)
+    parser.add_argument("--edge_logit_init_mean", type=float, default=10.0)
     parser.add_argument("--edge_logit_init_std", type=float, default=0.01)
     parser.add_argument("--random_mode", default="gumbel_sigmoid", choices=["gumbel_sigmoid", "none"])
     parser.add_argument("--gs_temp_edge", type=float, default=1.0)
 
     parser.add_argument("--lambda_sparse_e", type=float, default=1.0)
     parser.add_argument("--min_times_lambda_sparse_e", type=float, default=0.01)
-    parser.add_argument("--max_times_lambda_sparse_e", type=float, default=20.0)
+    parser.add_argument("--max_times_lambda_sparse_e", type=float, default=1.0)
 
     parser.add_argument("--lambda_complete_e", type=float, default=0.01)
     parser.add_argument("--completeness_start_frac", type=float, default=0.8)
 
     parser.add_argument("--snapshot_every", type=int, default=None,
-                         help="also snapshot circuits every N epochs, not just at the end (useful for long runs).")
-    parser.add_argument("--save_dir", default=None,
+                         help="also call finalize_and_report (boolean circuit + eval + save) every N "
+                              "epochs, not just at the end (useful for long runs).")
+    parser.add_argument("--epoch_snapshot_every", type=int, default=1,
+                         help="save a hand-pickable {acc, density, jaccard, edge_probs} snapshot for "
+                              "EVERY particle, every N epochs. 0 disables it.")
+    parser.add_argument("--save_dir", default="AAAA",
                          help="defaults to circuits_discovered/hubert_circuits/{task_type}/")
 
     parser.add_argument("--devices", nargs="+", default=None,
@@ -124,6 +158,31 @@ def parse_args() -> argparse.Namespace:
                               "(the multi-GPU synchronization point). Defaults to devices[0].")
 
     return parser.parse_args()
+
+
+def save_epoch_snapshot(
+    snapshot_dir: Path, *, epoch: int, seed: int, task_type: str,
+    train_acc: float, train_loss: float, edge_density: float,
+    jaccard_edge: float, jaccard_node: float,
+    edge_probs: torch.Tensor, summary: list[dict],
+) -> None:
+    """Same {epoch, train_acc, edge_density, edge_probs, ...} format as
+    pilot_hubert.py / run_hubert_sequential.py's save_epoch_snapshot, plus
+    this run's overall jaccard_edge/jaccard_node for that epoch (same value
+    across every particle's file for a given epoch -- it's a cohort-level
+    number -- kept per-file so each snapshot stands alone)."""
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    record = {
+        "task_type": task_type, "seed": seed, "epoch": epoch,
+        "train_acc": train_acc, "train_loss": train_loss, "edge_density": edge_density,
+        "jaccard_edge": jaccard_edge, "jaccard_node": jaccard_node,
+        "edge_probs": edge_probs.detach().cpu(),
+    }
+    torch.save(record, snapshot_dir / f"epoch{epoch:03d}.pt")
+
+    summary.append({k: v for k, v in record.items() if k != "edge_probs"})
+    with open(snapshot_dir / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
 
 
 def main() -> None:
@@ -197,6 +256,10 @@ def main() -> None:
 
     pairs_n = max(1, args.n_particles * (args.n_particles - 1) // 2)
 
+    # One epoch-snapshot dir + running summary per particle.
+    epoch_snapshot_dirs = [save_dir / f"particle{i}_epoch_snapshots" for i in range(args.n_particles)]
+    epoch_snapshot_summaries: list[list[dict]] = [[] for _ in range(args.n_particles)]
+
     print(
         f"Training {args.n_particles} particles jointly for {n_epochs} epochs "
         f"({len(train_loader)} steps/epoch, {len(node_keys)} nodes / {incidence_by_device[devices[0]].shape[1]} "
@@ -204,6 +267,9 @@ def main() -> None:
         f"lambda_edge_max={args.lambda_edge_max}, lambda_node_max={args.lambda_node_max}, "
         f"devices={sorted(set(devices))}, repulsion_device={hub_device}..."
     )
+    if args.epoch_snapshot_every:
+        print(f"Epoch snapshots (all {args.n_particles} particles) every {args.epoch_snapshot_every} "
+              f"epoch(s) -> {save_dir}/particle{{i}}_epoch_snapshots/")
     t0 = time.time()
 
     for epoch in range(n_epochs):
@@ -213,6 +279,7 @@ def main() -> None:
 
         epoch_task_loss = [0.0] * args.n_particles
         epoch_correct = [0] * args.n_particles
+        epoch_density = [0.0] * args.n_particles
         epoch_total = 0
         epoch_edge_rep = 0.0
         epoch_node_rep = 0.0
@@ -231,6 +298,11 @@ def main() -> None:
                 preds = logits.detach().argmax(dim=-1)
                 labels = batch["label"].to(device=logits.device)
                 epoch_correct[i] += (preds == labels).sum().item()
+                # Same convention as pilot_hubert.py / run_hubert_sequential.py:
+                # probs is flat_probs(p) = sigmoid(edge_logits), deterministic
+                # (no gumbel sampling in it). Threshold at 0.5 == logit>0, same
+                # as DiscoGP's own straight-through hard mask.
+                epoch_density[i] += (probs.detach() > 0.5).float().mean().item()
             epoch_total += batch["label"].shape[0]
 
             node_probs = [
@@ -268,14 +340,35 @@ def main() -> None:
                         particle, batch, lambda_complete=args.lambda_complete_e, num_classes=num_classes,
                     )
 
+        mean_jaccard_edge = epoch_edge_rep / n_batches / pairs_n
+        mean_jaccard_node = epoch_node_rep / n_batches / pairs_n
+
         print(
             f"epoch {epoch:3d}  "
             f"loss={[round(l / n_batches, 4) for l in epoch_task_loss]}  "
             f"train_acc={[round(c / epoch_total, 4) for c in epoch_correct]}  "
-            f"jaccard_edge={epoch_edge_rep / n_batches / pairs_n:.4f}  "
-            f"jaccard_node={epoch_node_rep / n_batches / pairs_n:.4f}  "
+            f"edge_density={[round(d / n_batches, 4) for d in epoch_density]}  "
+            f"jaccard_edge={mean_jaccard_edge:.4f}  "
+            f"jaccard_node={mean_jaccard_node:.4f}  "
             f"lambda_edge={lambda_edge_rep:.3f}  lambda_node={lambda_node_rep:.3f}"
         )
+
+        if args.epoch_snapshot_every and (epoch + 1) % args.epoch_snapshot_every == 0:
+            for i, particle in enumerate(particles):
+                # Once per particle per epoch, deterministic -- single source of
+                # truth for both this epoch's printed density AND the tensor
+                # saved for hand-picking / reuse as a --load_frozen reference.
+                # (Recomputed here rather than reusing the last batch's `probs`
+                # so the saved value doesn't depend on which batch happened to
+                # be last in the epoch.)
+                snapshot_edge_probs = flat_probs(particle.discogp).detach()
+                snapshot_density = (snapshot_edge_probs > 0.5).float().mean().item()
+                save_epoch_snapshot(
+                    epoch_snapshot_dirs[i], epoch=epoch + 1, seed=particle.seed, task_type=args.task_type,
+                    train_acc=epoch_correct[i] / epoch_total, train_loss=epoch_task_loss[i] / n_batches,
+                    edge_density=snapshot_density, jaccard_edge=mean_jaccard_edge, jaccard_node=mean_jaccard_node,
+                    edge_probs=snapshot_edge_probs, summary=epoch_snapshot_summaries[i],
+                )
 
         if epoch in snapshot_epochs:
             finalize_and_report(
@@ -287,6 +380,9 @@ def main() -> None:
         f"\nDone: {args.n_particles} {args.task_type} circuits, {n_epochs} epochs, "
         f"{elapsed:.1f}s. Saved under {save_dir}/"
     )
+    if args.epoch_snapshot_every:
+        for i, d in enumerate(epoch_snapshot_dirs):
+            print(f"Particle {i} epoch snapshots: {d}/ (scan {d}/summary.json)")
 
 
 if __name__ == "__main__":
