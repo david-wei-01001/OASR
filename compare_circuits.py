@@ -85,6 +85,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def circuit_display_name(path: str) -> str:
+    """Path(path).stem alone collides whenever multiple particles' epoch
+    snapshots share the same epoch number (e.g. every particle's "best"
+    epoch was hand-picked as epoch005 -- entirely plausible), which is
+    silently ambiguous in every printed/report line. Prefixing with the
+    immediate parent directory disambiguates (e.g. 'particle3/epoch005'
+    instead of a bare 'epoch005' six times over); the '_epoch_snapshots'
+    suffix that pilot_hubert.py/run_hubert.py/run_hubert_sequential.py all
+    use for that directory is stripped since it's the same on every path
+    and adds nothing."""
+    p = Path(path)
+    parent = p.parent.name
+    if parent.endswith("_epoch_snapshots"):
+        parent = parent[: -len("_epoch_snapshots")]
+    return f"{parent}/{p.stem}" if parent else p.stem
+
+
 def circuit_from_edge_probs(edge_probs: torch.Tensor, particle) -> Circuit:
     """Write this epoch's kept/not-kept decision into `particle`'s edge_logits
     (reused as scratch space -- boolean_circuit()/finalize_circuit() below
@@ -115,7 +132,7 @@ def circuit_from_edge_probs(edge_probs: torch.Tensor, particle) -> Circuit:
 
 def load_named_circuit(path: str, particle, data) -> dict[str, Any]:
     obj = torch.load(path, map_location=particle.device)
-    stem = Path(path).stem
+    name = circuit_display_name(path)
 
     if "circuit" in obj:
         circuit = obj["circuit"]
@@ -131,7 +148,7 @@ def load_named_circuit(path: str, particle, data) -> dict[str, Any]:
         raise ValueError(f"Unrecognized snapshot format at {path}: keys={list(obj.keys())}")
 
     return {
-        "name": stem,
+        "name": name,
         "path": path,
         "seed": obj.get("seed"),
         "epoch": obj.get("epoch"),
