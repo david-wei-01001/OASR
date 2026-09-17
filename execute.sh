@@ -12,14 +12,23 @@ done
 
 python run_hubert.py --task_type vowel_classification \
       --n_particles 5 --devices cuda:0 cuda:1 \
-      --jaccard_lambda inf \
-      --save_dir circuits_discovered/hubert_circuits/vowel_frank_laminf
+      --repulsion_device cuda:1 \
+      --jaccard_lambda 0.1 \
+      --lr_e 0.02 \
+      --save_dir circuits_discovered/hubert_circuits/vowel_frank_lam0.1 \
+      --lambda_edge_max 1.0 \
+      --lambda_sparse_e 2.0 \
+      --n_epochs 10
 
 python run_hubert.py --task_type vowel_classification \
       --n_particles 5 --devices cuda:0 cuda:1 \
       --repulsion_device cuda:1 \
-      --jaccard_lambda 0.0 \
-      --save_dir circuits_discovered/hubert_circuits/vowel_frank_lam0.0
+      --jaccard_lambda inf \
+      --lr_e 0.02 \
+      --save_dir circuits_discovered/hubert_circuits/vowel_frank_laminf \
+      --lambda_edge_max 1.0 \
+      --lambda_sparse_e 2.0 \
+      --n_epochs 10
 
 python run_hubert.py --task_type vowel_classification \
       --n_particles 5 --devices cuda:0 cuda:1 \
@@ -27,7 +36,9 @@ python run_hubert.py --task_type vowel_classification \
       --jaccard_lambda 1.0 \
       --lr_e 0.02 \
       --save_dir circuits_discovered/hubert_circuits/vowel_frank_lam1.0 \
-      --lambda_sparse_e 3.0
+      --lambda_edge_max 1.0 \
+      --lambda_sparse_e 2.0 \
+      --n_epochs 10
 
 
 python analyze_jaccard_gap.py \
