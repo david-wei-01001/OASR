@@ -227,8 +227,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gs_temp_edge", type=float, default=1.0)
 
     parser.add_argument("--lambda_sparse_e", type=float, default=2.5)
-    parser.add_argument("--min_times_lambda_sparse_e", type=float, default=0.01)
-    parser.add_argument("--max_times_lambda_sparse_e", type=float, default=1.0)
+    parser.add_argument("--min_times_lambda_sparse_e", type=float, default=1.0) # vowel class: 0.01
+    parser.add_argument("--max_times_lambda_sparse_e", type=float, default=1.0) # vowel class: 1.0
 
     parser.add_argument("--lambda_complete_e", type=float, default=0.0)
     parser.add_argument("--completeness_start_frac", type=float, default=0.0)
